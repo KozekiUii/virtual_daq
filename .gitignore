@@ -16,3 +16,4 @@ modules.order
 *.swp
 *.swo
 *~
+app/reader
