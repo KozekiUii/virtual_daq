@@ -5,6 +5,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/uaccess.h>
+#include <linux/spinlock.h>
 
 #define DEV_NAME "vdaq0"
 #define DEV_CNT (1)
@@ -16,6 +17,16 @@ struct vdaq_sample {
   __s16 channel[4];   // 4个模拟通道
   __u16 status;       // 状态，0表示正常
 };
+
+struct vdaq_dev {
+  struct vdaq_sample buf[1024];
+  int head;
+  int tail;
+  spinlock_t lock;
+  wait_queue_head_t wq;
+  struct hrtimer timer;
+  __u32 seq;
+}
 
 struct vdaq_device {
   dev_t devno;
