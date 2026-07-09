@@ -1,0 +1,22 @@
+CompileFlags:
+  Add:
+    - -fms-extensions
+    - -fgnu-extensions
+    - -D__KERNEL__
+    - -DMODULE
+    # 告诉 clangd 默认去哪里找当前系统的内核头文件（兜底方案）
+    - -I/lib/modules/5.10.160/build/include  # ⚠️ 换成你执行 uname -r 看到的版本
+    - -I/lib/modules/5.10.160/build/arch/x86/include
+
+  Remove:
+    - -m*
+    - -fconserve-stack
+    - -fno-allow-store-data-races
+    - -fmacro-prefix-map=*
+
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument
+    - pp_file_not_found
+    - declaration_mismatch
+    - type_specifier_missing # 专门对付像 static __init 这种内核宏导致的类型误报
