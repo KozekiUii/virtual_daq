@@ -4,13 +4,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include "vdaq_uapi.h"
 
-struct vdaq_sample {
-  uint64_t timestamp_ns;
-  uint32_t sequence;
-  int16_t channel[4];
-  uint16_t status;
-};
 
 int main() {
   struct vdaq_sample sample;
