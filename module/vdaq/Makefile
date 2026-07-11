@@ -3,6 +3,8 @@ PWD  := $(shell pwd)
 
 obj-m += vdaq.o
 
+ccflags-y += -I$(src)/../../include
+
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 

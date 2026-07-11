@@ -4,7 +4,7 @@
 #include <unistd.h>
 
 int main() {
-    int fd = open("/dev/vdaq0", O_RDONLY);
+    open("/dev/vdaq0", O_RDONLY);
 
     printf("opened, pid = %d\n", getpid());
     sleep(30);

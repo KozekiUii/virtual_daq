@@ -1,8 +1,13 @@
+/* ************************************************************************
+> File Name:     vdaq.c
+> Author:        Komorebi
+> Created Time:  2026年07月04日 星期六 11时38分52秒
+> Description:   
+ ************************************************************************/
 #include "vdaq_uapi.h"
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
-#include <linux/hrtimer.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -11,6 +16,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/compiler.h>
 
 #define DEV_NAME "vdaq0"
 #define DEV_CNT (1)
@@ -21,15 +27,17 @@
 
 // 全局设备结构
 struct vdaq_dev {
-  struct vdaq_sample buf[1024];
+  struct vdaq_sample buf[VDAQ_BUFF_SIZE];
   int head; // 环形缓冲区写指针
   int tail; // 环形缓冲区读指针
   spinlock_t lock;
   ktime_t period;
+  unsigned int sample_rate; // 采样率
+  struct mutex ctrl_lock; // 控制命令锁
   wait_queue_head_t wq;
   struct hrtimer timer;
   __u32 seq;
-  __u64 generate_samples;
+  __u64 generated_samples;
   __u64 dropped_samples;
   __u64 buffer_overflows;
   __u64 read_samples; // 读取的样本数
@@ -48,14 +56,11 @@ struct vdaq_device {
 /*******************************变量初始化**********************************************/
 static struct vdaq_device vdaq;
 static struct vdaq_dev vdev;
-static char vbuf[VDAQ_BUFF_SIZE];
 /*******************************变量初始化**********************************************/
 
 /*******************************函数声明**********************************************/
 static int vdaq_open(struct inode *inode, struct file *filp);
 static int vdaq_release(struct inode *inode, struct file *filp);
-static ssize_t vdaq_write(struct file *filp, const char __user *buf,
-                          size_t count, loff_t *ppos);
 static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
                          loff_t *ppos);
 static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer);
@@ -65,13 +70,12 @@ static bool vdaq_ring_empty(struct vdaq_dev *dev);
 static long vdaq_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 /*******************************函数声明**********************************************/
 
-static struct file_operations vdaq_fops = {
+static const struct file_operations vdaq_fops = {
     .owner = THIS_MODULE,
-    .open = vdaq_open,
-    .release = vdaq_release,
-    .write = vdaq_write,
     .read = vdaq_read,
     .unlocked_ioctl = vdaq_ioctl,
+    .open = vdaq_open,
+    .release = vdaq_release,
 };
 
 static int vdaq_open(struct inode *inode, struct file *filp) {
@@ -102,28 +106,6 @@ static int vdaq_ring_pop(struct vdaq_dev *dev, struct vdaq_sample *sample) {
   return 0; // 成功弹出数据
 }
 
-static ssize_t vdaq_write(struct file *filp, const char __user *buf,
-                          size_t count, loff_t *ppos) {
-  size_t write_count;
-
-  if (*ppos >= VDAQ_BUFF_SIZE) {
-    return -ENOSPC;
-  }
-
-  write_count = count;
-  if (*ppos + write_count > VDAQ_BUFF_SIZE) {
-    write_count = VDAQ_BUFF_SIZE - *ppos;
-  }
-
-  if (copy_from_user(vbuf + *ppos, buf, write_count)) {
-    return -EFAULT;
-  }
-
-  *ppos += write_count;
-  printk(KERN_INFO "vdaq: Wrote %zu bytes\n", write_count);
-  return write_count; // 关键：必须返回实际写入的字节数
-}
-
 static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
                          loff_t *ppos) {
   struct vdaq_sample readData;
@@ -131,7 +113,7 @@ static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
     return -EINVAL;
   }
   // 如果环形缓冲区为空，则阻塞等待
-  if (wait_event_interruptible(vdev.wq, !vdaq_ring_empty(&vdev))) {
+  if (wait_event_interruptible(vdev.wq, !vdaq_ring_empty(&vdev) || !vdev.running)) {
     return -EINTR; // 如果被信号中断，则返回错误
   }
 
@@ -140,7 +122,7 @@ static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
   }
   // 从环形缓冲区中弹出数据
   if (vdaq_ring_pop(&vdev, &readData) < 0) {
-    return -EFAULT;
+    return -EAGAIN;
   }
   // 将数据拷贝到用户空间
   if (copy_to_user(buf, &readData, sizeof(struct vdaq_sample))) {
@@ -154,72 +136,102 @@ static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
 
 static long vdaq_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
   switch (cmd) {
-  case VDAQ_IOCTL_GET_STATS: {
-    struct vdaq_stats stats;
-    unsigned long flags;
+    case VDAQ_IOCTL_GET_STATUS: {
+      struct vdaq_stats stats;
+      unsigned long flags;
 
-    spin_lock_irqsave(&vdev.lock, flags);
-    stats.generated_samples = vdev.generate_samples;
-    stats.read_samples = vdev.read_samples;
-    stats.dropped_samples = vdev.dropped_samples;
-    stats.buffer_overflows = vdev.buffer_overflows;
-    stats.current_sequence = vdev.seq;
-    stats.buffer_head = vdev.head;
-    stats.buffer_tail = vdev.tail;
-    spin_unlock_irqrestore(&vdev.lock, flags);
+      spin_lock_irqsave(&vdev.lock, flags);
+      stats.generated_samples = vdev.generated_samples;
+      stats.read_samples = vdev.read_samples;
+      stats.dropped_samples = vdev.dropped_samples;
+      stats.buffer_overflows = vdev.buffer_overflows;
+      stats.current_sequence = vdev.seq;
+      stats.buffer_head = vdev.head;
+      stats.buffer_tail = vdev.tail;
+      stats.running = vdev.running;
 
-    if (copy_to_user((void __user *)arg, &stats, sizeof(stats))) {
-      return -EFAULT;
+      spin_unlock_irqrestore(&vdev.lock, flags);
+
+      if (copy_to_user((void __user *)arg, &stats, sizeof(stats))) {
+        return -EFAULT;
+      }
+      break;
     }
-    break;
-  }
-  case VDAQ_IOCTL_STOP: {
-    // 加入need_cancel标志，避免在spin_lock中调用hrtimer_cancel
-    bool need_cancel = false;
-    unsigned long flags;
-    spin_lock_irqsave(&vdev.lock, flags);
-    if (vdev.running) {
-      vdev.running = false;
-      need_cancel = true;
+    case VDAQ_IOCTL_STOP: {
+      mutex_lock(&vdev.ctrl_lock);
+      if (vdev.running) {
+        vdev.running = false;
+        hrtimer_cancel(&vdev.timer);
+        wake_up_interruptible(&vdev.wq); // 唤醒等待队列中的进程
+      }
+      mutex_unlock(&vdev.ctrl_lock);
+      break;
     }
-    spin_unlock_irqrestore(&vdev.lock, flags);
-    if (need_cancel) {
+    case VDAQ_IOCTL_START: {
+      mutex_lock(&vdev.ctrl_lock);
+      if (!vdev.running) {
+        vdev.running = true;
+        hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
+      }
+      mutex_unlock(&vdev.ctrl_lock);        
+      break;
+    }
+    case VDAQ_IOCTL_CLEAR_BUFFER: {
+      unsigned long flags;
+      spin_lock_irqsave(&vdev.lock, flags);
+      vdev.head = 0;
+      vdev.tail = 0;
+      spin_unlock_irqrestore(&vdev.lock, flags);
+      break;
+    }
+    case VDAQ_IOCTL_SET_RATE: {
+      unsigned int new_rate;
+      ktime_t new_period;
+      if (copy_from_user(&new_rate, (unsigned int __user *)arg,
+                         sizeof(new_rate))) {
+        return -EFAULT;
+      }
+      if (new_rate > 10000 || new_rate < 1) {
+        return -EINVAL;
+      }
+      new_period = ktime_set(0, NSEC_PER_SEC/new_rate);
+      
+      mutex_lock(&vdev.ctrl_lock);
       hrtimer_cancel(&vdev.timer);
-      wake_up_interruptible(&vdev.wq); // 唤醒等待队列中的进程
+      WRITE_ONCE(vdev.period,new_period);
+      vdev.sample_rate = new_rate;
+      if (vdev.running) {
+        hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
+      }
+      mutex_unlock(&vdev.ctrl_lock);
+      break;
     }
-    break;
-  }
-  case VDAQ_IOCTL_START: {
-    bool need_start = false;
-    unsigned long flags;
-    spin_lock_irqsave(&vdev.lock, flags);
-    if (!vdev.running) {
-      vdev.running = true;
-      need_start = true;
+    default:
+      return -ENOTTY;
     }
-    spin_unlock_irqrestore(&vdev.lock, flags);
-    if (need_start) {
-      hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
-    }
-    break;
-  }
-  default:
-    return -ENOTTY;
-    
   return 0;
-  }
 }
+
 
 // 将采样数据写入环形缓冲区
 static void vdaq_ring_push(struct vdaq_dev *dev, struct vdaq_sample *sample) {
   unsigned long flags;
   spin_lock_irqsave(&dev->lock, flags);
+  
+  sample->sequence = dev->seq++;
+  sample->channel[0] = sample->sequence;
+  sample->channel[1] = sample->sequence * 2;
+  sample->channel[2] = -sample->sequence;
+  sample->channel[3] = sample->sequence % 100;
+  dev->generated_samples++;
+
   dev->buf[dev->head] = *sample;
   dev->head = (dev->head + 1) % VDAQ_BUFF_SIZE;
   if (dev->head == dev->tail) {
     // 缓冲区满，覆盖最旧的数据
     dev->tail = (dev->tail + 1) % VDAQ_BUFF_SIZE;
     dev->dropped_samples++;
+    dev->buffer_overflows++;
   }
   spin_unlock_irqrestore(&dev->lock, flags);
   wake_up_interruptible(&dev->wq); // 唤醒等待队列中的进程
@@ -230,6 +242,7 @@ static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer) {
   struct vdaq_dev *dev;
   struct vdaq_sample sample;
   unsigned long flags;
+  ktime_t period;
   // 通过 hrtimer 成员地址反推出所属的 struct vdaq_dev 对象
   dev = container_of(timer, struct vdaq_dev, timer);
 
@@ -239,31 +252,48 @@ static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer) {
     return HRTIMER_NORESTART; // 如果设备未运行，则不重新启动定时器
   }
   spin_unlock_irqrestore(&dev->lock, flags);
+
   // 生成采样数据
   sample.timestamp_ns = ktime_get_ns();
-  sample.sequence = dev->seq++;
-  sample.channel[0] = sample.sequence;
-  sample.channel[1] = sample.sequence * 2;
-  sample.channel[2] = -sample.sequence;
-  sample.channel[3] = sample.sequence % 100;
   sample.status = 0; // 状态正常
-  dev->generate_samples++;
+  
   // 写入环形缓冲区
   vdaq_ring_push(dev, &sample);
 
   if (dev->seq % 100 == 0)
     printk(KERN_INFO "dev.seq=%u, generate_samples=%llu, dropped_samples=%llu, "
                      "head=%d, tail=%d\n",
-           dev->seq, dev->generate_samples, dev->dropped_samples, dev->head,
+           dev->seq, dev->generated_samples, dev->dropped_samples, dev->head,
            dev->tail);
+
   // 基于当前时间,timer之后一个period再次callback
-  hrtimer_forward_now(timer, dev->period);
+  period = READ_ONCE(dev->period); // 避免直接访问共享变量, ktime_t在ARM64上读取时原子的，READ_ONCE防止编译器优化，从内存中读取真实数据
+  hrtimer_forward_now(timer, period);
 
   return HRTIMER_RESTART; // 定时器触发后继续运行
 }
 
 static int __init vdaq_init(void) {
   int ret = 0;
+  
+  // 1. vdev初始化
+  vdev.head = 0;
+  vdev.tail = 0;
+  vdev.seq = 0;
+  vdev.read_samples = 0;
+  vdev.buffer_overflows = 0;
+  vdev.generated_samples = 0;
+  vdev.dropped_samples = 0;
+  vdev.running = true;
+  vdev.sample_rate = 100; // 默认采样率 100Hz
+  spin_lock_init(&vdev.lock);
+  mutex_init(&vdev.ctrl_lock);
+  init_waitqueue_head(&vdev.wq);
+  // 设置 period = 10ms
+  vdev.period = ktime_set(0, VDAQ_PERIOD_NS);
+
+  // 2. 创建设备节点
+
   printk("chrdev init\n");
   ret = alloc_chrdev_region(&vdaq.devno, 0, DEV_CNT, DEV_NAME);
   if (ret < 0) {
@@ -280,7 +310,7 @@ static int __init vdaq_init(void) {
     goto add_err;
   }
 
-  vdaq.class = class_create(DEV_NAME);
+  vdaq.class = class_create(THIS_MODULE, DEV_NAME);
   // vdaq.class = class_create(THIS_MODULE, DEV_NAME); // C90标准
 
   if (IS_ERR(vdaq.class)) {
@@ -296,22 +326,14 @@ static int __init vdaq_init(void) {
     goto device_err;
   }
 
-  // hrtimer启动 建议在所有资源创建成功之后
-  vdev.head = 0;
-  vdev.tail = 0;
-  vdev.seq = 0;
-  vdev.generate_samples = 0;
-  vdev.dropped_samples = 0;
-  vdev.running = true;
-  spin_lock_init(&vdev.lock);
-  init_waitqueue_head(&vdev.wq);
-  // 设置 period = 10ms
-  vdev.period = ktime_set(0, VDAQ_PERIOD_NS);
+  
+  // 3. hrtimer启动 建议在所有资源创建成功之后
   // hrtimer初始化
-  hrtimer_setup(&vdev.timer, vdaq_timer_callback, CLOCK_MONOTONIC,
-                HRTIMER_MODE_REL);
+  // hrtimer_setup(&vdev.timer, vdaq_timer_callback, CLOCK_MONOTONIC,
+  // HRTIMER_MODE_REL);
   // // 设置回调函数, 内核6.14版本之前需手动设置回调函数,
-  // 内核6.14版本之后不需要手动设置 vdev.timer.function = vdaq_timer_callback;
+  hrtimer_init(&vdev.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+  vdev.timer.function = vdaq_timer_callback;
   // 启动hrtimer, 每过period后触发回调函数
   hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
 

@@ -10,9 +10,11 @@
 #endif
 
 #define VDAQ_IOCTL_MAGIC 'v'
-#define VDAQ_IOCTL_GET_STATS _IOR(VDAQ_IOCTL_MAGIC, 1, struct vdaq_stats)
+#define VDAQ_IOCTL_GET_STATUS _IOR(VDAQ_IOCTL_MAGIC, 1, struct vdaq_stats)
 #define VDAQ_IOCTL_START _IO(VDAQ_IOCTL_MAGIC, 2)
 #define VDAQ_IOCTL_STOP _IO(VDAQ_IOCTL_MAGIC, 3)
+#define VDAQ_IOCTL_CLEAR_BUFFER _IO(VDAQ_IOCTL_MAGIC, 4)
+#define VDAQ_IOCTL_SET_RATE _IOW(VDAQ_IOCTL_MAGIC, 5, unsigned int)
 
 struct vdaq_sample {
 #ifdef __KERNEL__
@@ -37,7 +39,7 @@ struct vdaq_stats {
     __u32 current_sequence;
     __u32 buffer_head;
     __u32 buffer_tail;
-    __u32 runing; // 1表示正在运行，0表示已停止
+    __u32 running; // 1表示正在运行，0表示已停止
 #else
     uint64_t generated_samples;
     uint64_t read_samples;
@@ -46,7 +48,7 @@ struct vdaq_stats {
     uint32_t current_sequence;
     uint32_t buffer_head;
     uint32_t buffer_tail;
-    uint32_t runing; // 1表示正在运行，0表示已停止
+    uint32_t running; // 1表示正在运行，0表示已停止
 #endif
 };
 
