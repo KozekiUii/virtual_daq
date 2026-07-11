@@ -1,370 +1,490 @@
-/* ************************************************************************
-> File Name:     vdaq.c
-> Author:        Komorebi
-> Created Time:  2026年07月04日 星期六 11时38分52秒
-> Description:   
- ************************************************************************/
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * vdaq.c - Virtual multi-channel data acquisition character driver
+ *
+ * Copyright (C) 2026 Komorebi
+ *
+ * The driver uses an hrtimer to simulate a periodic hardware sampling source.
+ * Samples are stored in a ring buffer and consumed by userspace through read().
+ * Device status and runtime controls are exposed through ioctl commands.
+ */
+
 #include "vdaq_uapi.h"
+
 #include <linux/cdev.h>
+#include <linux/compiler.h>
 #include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/hrtimer.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
-#include <linux/compiler.h>
 
-#define DEV_NAME "vdaq0"
-#define DEV_CNT (1)
-#define VDAQ_BUFF_SIZE 1024
-#define VDAQ_PERIOD_NS 10000000L
+#define VDAQ_DEVICE_NAME	"vdaq0"
+#define VDAQ_DEVICE_COUNT	1
+#define VDAQ_BUFFER_SIZE	1024
+#define VDAQ_DEFAULT_RATE_HZ	100U
+#define VDAQ_MAX_RATE_HZ	10000U
+#define VDAQ_DEFAULT_PERIOD_NS	(NSEC_PER_SEC / VDAQ_DEFAULT_RATE_HZ)
 
-/*******************************结构体存放*********************************************/
-
-// 全局设备结构
+/**
+ * struct vdaq_dev - Runtime state of the virtual acquisition engine
+ * @buffer:              Ring buffer used to store generated samples
+ * @head:                Index of the next write position
+ * @tail:                Index of the next read position
+ * @data_lock:           Protects the ring buffer, counters and running state
+ * @period:              Current hrtimer period
+ * @sample_rate:         Current sampling rate in Hz
+ * @control_lock:        Serializes START, STOP and SET_RATE operations
+ * @read_queue:          Wait queue used by blocking readers
+ * @timer:               High-resolution timer used as the sample source
+ * @sequence:            Sequence number assigned to the next sample
+ * @generated_samples:   Number of generated samples
+ * @dropped_samples:     Number of samples discarded because the buffer was full
+ * @buffer_overflows:    Number of ring-buffer overflow events
+ * @read_samples:        Number of samples removed by userspace
+ * @running:             True while periodic sampling is enabled
+ */
 struct vdaq_dev {
-  struct vdaq_sample buf[VDAQ_BUFF_SIZE];
-  int head; // 环形缓冲区写指针
-  int tail; // 环形缓冲区读指针
-  spinlock_t lock;
-  ktime_t period;
-  unsigned int sample_rate; // 采样率
-  struct mutex ctrl_lock; // 控制命令锁
-  wait_queue_head_t wq;
-  struct hrtimer timer;
-  __u32 seq;
-  __u64 generated_samples;
-  __u64 dropped_samples;
-  __u64 buffer_overflows;
-  __u64 read_samples; // 读取的样本数
-  bool running;
+	struct vdaq_sample buffer[VDAQ_BUFFER_SIZE];
+	unsigned int head;
+	unsigned int tail;
+	spinlock_t data_lock;
+	ktime_t period;
+	unsigned int sample_rate;
+	struct mutex control_lock;
+	wait_queue_head_t read_queue;
+	struct hrtimer timer;
+	u32 sequence;
+	u64 generated_samples;
+	u64 dropped_samples;
+	u64 buffer_overflows;
+	u64 read_samples;
+	bool running;
 };
 
-// 数据结构
-struct vdaq_device {
-  dev_t devno;
-  struct cdev cdev;
-  struct class *class;
-  struct device *device;
+/**
+ * struct vdaq_chrdev - Character-device registration resources
+ * @devno:  Allocated major/minor device number
+ * @cdev:   Character-device object
+ * @class:  Device class exported through sysfs
+ * @device: Device object used to create /dev/vdaq0
+ */
+struct vdaq_chrdev {
+	dev_t devno;
+	struct cdev cdev;
+	struct class *class;
+	struct device *device;
 };
-/*******************************结构体存放*********************************************/
 
-/*******************************变量初始化**********************************************/
-static struct vdaq_device vdaq;
-static struct vdaq_dev vdev;
-/*******************************变量初始化**********************************************/
+static struct vdaq_chrdev vdaq_chrdev;
+static struct vdaq_dev vdaq_device;
 
-/*******************************函数声明**********************************************/
-static int vdaq_open(struct inode *inode, struct file *filp);
-static int vdaq_release(struct inode *inode, struct file *filp);
-static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
-                         loff_t *ppos);
+/* File-operation callbacks. */
+static int vdaq_open(struct inode *inode, struct file *file);
+static int vdaq_release(struct inode *inode, struct file *file);
+static ssize_t vdaq_read(struct file *file, char __user *buf, size_t count,
+			 loff_t *ppos);
+static long vdaq_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
+/* Sampling and ring-buffer helpers. */
 static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer);
 static void vdaq_ring_push(struct vdaq_dev *dev, struct vdaq_sample *sample);
 static int vdaq_ring_pop(struct vdaq_dev *dev, struct vdaq_sample *sample);
-static bool vdaq_ring_empty(struct vdaq_dev *dev);
-static long vdaq_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
-/*******************************函数声明**********************************************/
+static bool vdaq_ring_empty(const struct vdaq_dev *dev);
 
 static const struct file_operations vdaq_fops = {
     .owner = THIS_MODULE,
     .read = vdaq_read,
     .unlocked_ioctl = vdaq_ioctl,
     .open = vdaq_open,
-    .release = vdaq_release,
+    .release	= vdaq_release,
+	
 };
 
-static int vdaq_open(struct inode *inode, struct file *filp) {
-  printk(KERN_INFO "vdaq: Device opened\n");
-  return 0;
+static int vdaq_open(struct inode *inode, struct file *file)
+{
+	pr_info("vdaq: device opened\n");
+	return 0;
 }
 
-static int vdaq_release(struct inode *inode, struct file *filp) {
-  printk(KERN_INFO "vdaq: Device released\n");
-  return 0;
+static int vdaq_release(struct inode *inode, struct file *file)
+{
+	pr_info("vdaq: device released\n");
+	return 0;
 }
 
-static bool vdaq_ring_empty(struct vdaq_dev *dev) {
-  return dev->head == dev->tail;
+/**
+ * vdaq_ring_empty - Check whether the ring buffer contains no samples
+ * @dev: Virtual acquisition device
+ *
+ * The caller only needs a transient condition check. The definitive empty check
+ * used before removing data is repeated under @data_lock in vdaq_ring_pop().
+ */
+static bool vdaq_ring_empty(const struct vdaq_dev *dev)
+{
+	return READ_ONCE(dev->head) == READ_ONCE(dev->tail);
 }
 
-static int vdaq_ring_pop(struct vdaq_dev *dev, struct vdaq_sample *sample) {
-  unsigned long flags;
-  spin_lock_irqsave(&dev->lock, flags);
-  if (dev->head == dev->tail) {
-    spin_unlock_irqrestore(&dev->lock, flags);
-    return -1; // 缓冲区为空
-  }
-  *sample = dev->buf[dev->tail];
-  dev->tail = (dev->tail + 1) % VDAQ_BUFF_SIZE;
-  dev->read_samples++;
-  spin_unlock_irqrestore(&dev->lock, flags);
-  return 0; // 成功弹出数据
+/**
+ * vdaq_ring_pop - Remove one sample from the ring buffer
+ * @dev:    Virtual acquisition device
+ * @sample: Destination for the removed sample
+ *
+ * Return: 0 on success, -ENODATA if the buffer is empty.
+ */
+static int vdaq_ring_pop(struct vdaq_dev *dev, struct vdaq_sample *sample)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->data_lock, flags);
+
+	if (dev->head == dev->tail) {
+		spin_unlock_irqrestore(&dev->data_lock, flags);
+		return -ENODATA;
+	}
+
+	*sample = dev->buffer[dev->tail];
+	dev->tail = (dev->tail + 1) % VDAQ_BUFFER_SIZE;
+	dev->read_samples++;
+
+	spin_unlock_irqrestore(&dev->data_lock, flags);
+	return 0;
 }
 
-static ssize_t vdaq_read(struct file *filp, char __user *buf, size_t count,
-                         loff_t *ppos) {
-  struct vdaq_sample readData;
-  if (count < sizeof(struct vdaq_sample)) {
-    return -EINVAL;
-  }
-  // 如果环形缓冲区为空，则阻塞等待
-  if (wait_event_interruptible(vdev.wq, !vdaq_ring_empty(&vdev) || !vdev.running)) {
-    return -EINTR; // 如果被信号中断，则返回错误
-  }
+/**
+ * vdaq_read - Read one sample from the acquisition stream
+ *
+ * The call blocks while sampling is running and the ring buffer is empty.
+ * Stopping the device wakes blocked readers. If no buffered sample remains,
+ * -EAGAIN is returned.
+ */
+static ssize_t vdaq_read(struct file *file, char __user *buf, size_t count,
+			 loff_t *ppos)
+{
+	struct vdaq_sample sample;
+	int ret;
 
-  if (vdaq_ring_empty(&vdev) && !vdev.running) {
-    return -EFAULT; // 再次检查环形缓冲区是否为空
-  }
-  // 从环形缓冲区中弹出数据
-  if (vdaq_ring_pop(&vdev, &readData) < 0) {
-    return -EAGAIN;
-  }
-  // 将数据拷贝到用户空间
-  if (copy_to_user(buf, &readData, sizeof(struct vdaq_sample))) {
-    return -EFAULT;
-  }
-  // 不需要再增加 *ppos，因为是从环形缓冲区中读取数据，而不是从文件中读取数据
-  // *ppos += sizeof(struct vdaq_sample);
+	if (count < sizeof(sample))
+		return -EINVAL;
 
-  return sizeof(struct vdaq_sample);
+	/* 如果环形缓冲区为空，则阻塞等待。停止设备也会唤醒读进程。 */
+	ret = wait_event_interruptible(
+		vdaq_device.read_queue,
+		!vdaq_ring_empty(&vdaq_device) ||
+		!READ_ONCE(vdaq_device.running));
+	if (ret)
+		return ret;
+
+	if (vdaq_ring_empty(&vdaq_device) &&
+	    !READ_ONCE(vdaq_device.running))
+		return -EAGAIN;
+
+	ret = vdaq_ring_pop(&vdaq_device, &sample);
+	if (ret)
+		return ret;
+
+	/* copy_to_user() 可能睡眠，因此必须在释放自旋锁后调用。 */
+	if (copy_to_user(buf, &sample, sizeof(sample)))
+		return -EFAULT;
+
+	/* 数据源是持续流，不使用文件偏移量 *ppos。 */
+	return sizeof(sample);
 }
 
-static long vdaq_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
-  switch (cmd) {
-    case VDAQ_IOCTL_GET_STATUS: {
-      struct vdaq_stats stats;
-      unsigned long flags;
+/**
+ * vdaq_ioctl - Handle userspace control requests
+ *
+ * The control mutex serializes timer lifecycle changes. The spinlock protects
+ * the high-frequency data path and status counters.
+ */
+static long vdaq_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct vdaq_dev *dev = &vdaq_device;
 
-      spin_lock_irqsave(&vdev.lock, flags);
-      stats.generated_samples = vdev.generated_samples;
-      stats.read_samples = vdev.read_samples;
-      stats.dropped_samples = vdev.dropped_samples;
-      stats.buffer_overflows = vdev.buffer_overflows;
-      stats.current_sequence = vdev.seq;
-      stats.buffer_head = vdev.head;
-      stats.buffer_tail = vdev.tail;
-      stats.running = vdev.running;
+	switch (cmd) {
+	case VDAQ_IOCTL_GET_STATUS:
+	{
+		struct vdaq_stats stats;
+		unsigned long flags;
 
-      spin_unlock_irqrestore(&vdev.lock, flags);
+		spin_lock_irqsave(&dev->data_lock, flags);
+		stats.generated_samples = dev->generated_samples;
+		stats.read_samples = dev->read_samples;
+		stats.dropped_samples = dev->dropped_samples;
+		stats.buffer_overflows = dev->buffer_overflows;
+		stats.current_sequence = dev->sequence;
+		stats.buffer_head = dev->head;
+		stats.buffer_tail = dev->tail;
+		stats.running = dev->running;
+		spin_unlock_irqrestore(&dev->data_lock, flags);
 
-      if (copy_to_user((void __user *)arg, &stats, sizeof(stats))) {
-        return -EFAULT;
-      }
-      break;
-    }
-    case VDAQ_IOCTL_STOP: {
-      mutex_lock(&vdev.ctrl_lock);
-      if (vdev.running) {
-        vdev.running = false;
-        hrtimer_cancel(&vdev.timer);
-        wake_up_interruptible(&vdev.wq); // 唤醒等待队列中的进程
-      }
-      mutex_unlock(&vdev.ctrl_lock);
-      break;
-    }
-    case VDAQ_IOCTL_START: {
-      mutex_lock(&vdev.ctrl_lock);
-      if (!vdev.running) {
-        vdev.running = true;
-        hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
-      }
-      mutex_unlock(&vdev.ctrl_lock);        
-      break;
-    }
-    case VDAQ_IOCTL_CLEAR_BUFFER: {
-      unsigned long flags;
-      spin_lock_irqsave(&vdev.lock, flags);
-      vdev.head = 0;
-      vdev.tail = 0;
-      spin_unlock_irqrestore(&vdev.lock, flags);
-      break;
-    }
-    case VDAQ_IOCTL_SET_RATE: {
-      unsigned int new_rate;
-      ktime_t new_period;
-      if (copy_from_user(&new_rate, (unsigned int __user *)arg,
-                         sizeof(new_rate))) {
-        return -EFAULT;
-      }
-      if (new_rate > 10000 || new_rate < 1) {
-        return -EINVAL;
-      }
-      new_period = ktime_set(0, NSEC_PER_SEC/new_rate);
-      
-      mutex_lock(&vdev.ctrl_lock);
-      hrtimer_cancel(&vdev.timer);
-      WRITE_ONCE(vdev.period,new_period);
-      vdev.sample_rate = new_rate;
-      if (vdev.running) {
-        hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
-      }
-      mutex_unlock(&vdev.ctrl_lock);
-      break;
-    }
-    default:
-      return -ENOTTY;
-    }
-  return 0;
+		if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
+			return -EFAULT;
+		break;
+	}
+
+	case VDAQ_IOCTL_START:
+		mutex_lock(&dev->control_lock);
+		if (!READ_ONCE(dev->running)) {
+			WRITE_ONCE(dev->running, true);
+			hrtimer_start(&dev->timer, READ_ONCE(dev->period),
+				      HRTIMER_MODE_REL);
+		}
+		mutex_unlock(&dev->control_lock);
+		break;
+
+	case VDAQ_IOCTL_STOP:
+		mutex_lock(&dev->control_lock);
+		if (READ_ONCE(dev->running)) {
+			WRITE_ONCE(dev->running, false);
+
+			/*
+			 * hrtimer_cancel() may wait for an active callback, so it
+			 * must not be called while holding the data spinlock.
+			 */
+			hrtimer_cancel(&dev->timer);
+			wake_up_interruptible(&dev->read_queue);
+		}
+		mutex_unlock(&dev->control_lock);
+		break;
+
+	case VDAQ_IOCTL_CLEAR_BUFFER:
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&dev->data_lock, flags);
+		dev->head = 0;
+		dev->tail = 0;
+		spin_unlock_irqrestore(&dev->data_lock, flags);
+		break;
+	}
+
+	case VDAQ_IOCTL_SET_RATE:
+	{
+		unsigned int new_rate;
+		ktime_t new_period;
+
+		if (copy_from_user(&new_rate, (unsigned int __user *)arg,
+				   sizeof(new_rate)))
+			return -EFAULT;
+
+		if (new_rate < 1 || new_rate > VDAQ_MAX_RATE_HZ)
+			return -EINVAL;
+
+		new_period = ns_to_ktime(NSEC_PER_SEC / new_rate);
+
+		mutex_lock(&dev->control_lock);
+
+		/* Stop the current schedule before publishing the new period. */
+		hrtimer_cancel(&dev->timer);
+		WRITE_ONCE(dev->period, new_period);
+		dev->sample_rate = new_rate;
+
+		/* Changing the rate must not implicitly start a stopped device. */
+		if (READ_ONCE(dev->running))
+			hrtimer_start(&dev->timer, new_period, HRTIMER_MODE_REL);
+
+		mutex_unlock(&dev->control_lock);
+		break;
+	}
+
+	default:
+		return -ENOTTY;
+	}
+
+	return 0;
 }
 
+/**
+ * vdaq_ring_push - Generate metadata and append one sample to the ring buffer
+ * @dev:    Virtual acquisition device
+ * @sample: Partially initialized sample; timestamp and status are set by caller
+ *
+ * When the buffer is full, the oldest sample is overwritten. One slot is kept
+ * unused so that head == tail unambiguously represents an empty buffer.
+ */
+static void vdaq_ring_push(struct vdaq_dev *dev, struct vdaq_sample *sample)
+{
+	unsigned long flags;
 
-// 将采样数据写入环形缓冲区
-static void vdaq_ring_push(struct vdaq_dev *dev, struct vdaq_sample *sample) {
-  unsigned long flags;
-  spin_lock_irqsave(&dev->lock, flags);
-  
-  sample->sequence = dev->seq++;
-  sample->channel[0] = sample->sequence;
-  sample->channel[1] = sample->sequence * 2;
-  sample->channel[2] = -sample->sequence;
-  sample->channel[3] = sample->sequence % 100;
-  dev->generated_samples++;
+	spin_lock_irqsave(&dev->data_lock, flags);
 
-  dev->buf[dev->head] = *sample;
-  dev->head = (dev->head + 1) % VDAQ_BUFF_SIZE;
-  if (dev->head == dev->tail) {
-    // 缓冲区满，覆盖最旧的数据
-    dev->tail = (dev->tail + 1) % VDAQ_BUFF_SIZE;
-    dev->dropped_samples++;
-    dev->buffer_overflows++;
-  }
-  spin_unlock_irqrestore(&dev->lock, flags);
-  wake_up_interruptible(&dev->wq); // 唤醒等待队列中的进程
+	sample->sequence = dev->sequence++;
+	sample->channel[0] = sample->sequence;
+	sample->channel[1] = sample->sequence * 2;
+	sample->channel[2] = -(s16)sample->sequence;
+	sample->channel[3] = sample->sequence % 100;
+	dev->generated_samples++;
+
+	dev->buffer[dev->head] = *sample;
+	dev->head = (dev->head + 1) % VDAQ_BUFFER_SIZE;
+
+	if (dev->head == dev->tail) {
+		/* 缓冲区满，覆盖最旧的数据。 */
+		dev->tail = (dev->tail + 1) % VDAQ_BUFFER_SIZE;
+		dev->dropped_samples++;
+		dev->buffer_overflows++;
+	}
+
+	spin_unlock_irqrestore(&dev->data_lock, flags);
+
+	/* New data is available to blocking readers. */
+	wake_up_interruptible(&dev->read_queue);
 }
 
-// hrtimer回调函数
-static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer) {
-  struct vdaq_dev *dev;
-  struct vdaq_sample sample;
-  unsigned long flags;
-  ktime_t period;
-  // 通过 hrtimer 成员地址反推出所属的 struct vdaq_dev 对象
-  dev = container_of(timer, struct vdaq_dev, timer);
+/**
+ * vdaq_timer_callback - Periodically generate one virtual DAQ sample
+ * @timer: hrtimer embedded in struct vdaq_dev
+ *
+ * Return: HRTIMER_RESTART while acquisition is running, otherwise
+ * HRTIMER_NORESTART.
+ */
+static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer)
+{
+	struct vdaq_dev *dev;
+	struct vdaq_sample sample;
+	ktime_t period;
+	u32 sequence;
+	u64 generated;
+	u64 dropped;
+	unsigned int head;
+	unsigned int tail;
+	unsigned long flags;
+	bool print_status;
 
-  spin_lock_irqsave(&dev->lock, flags);
-  if (!dev->running) {
-    spin_unlock_irqrestore(&dev->lock, flags);
-    return HRTIMER_NORESTART; // 如果设备未运行，则不重新启动定时器
-  }
-  spin_unlock_irqrestore(&dev->lock, flags);
+	/* 通过 hrtimer 成员地址反推出所属的 struct vdaq_dev 对象。 */
+	dev = container_of(timer, struct vdaq_dev, timer);
 
-  // 生成采样数据
-  sample.timestamp_ns = ktime_get_ns();
-  sample.status = 0; // 状态正常
-  
-  // 写入环形缓冲区
-  vdaq_ring_push(dev, &sample);
+	if (!READ_ONCE(dev->running))
+		return HRTIMER_NORESTART;
 
-  if (dev->seq % 100 == 0)
-    printk(KERN_INFO "dev.seq=%u, generate_samples=%llu, dropped_samples=%llu, "
-                     "head=%d, tail=%d\n",
-           dev->seq, dev->generated_samples, dev->dropped_samples, dev->head,
-           dev->tail);
+	memset(&sample, 0, sizeof(sample));
+	sample.timestamp_ns = ktime_get_ns();
+	sample.status = 0; /* 状态正常。 */
 
-  // 基于当前时间,timer之后一个period再次callback
-  period = READ_ONCE(dev->period); // 避免直接访问共享变量, ktime_t在ARM64上读取时原子的，READ_ONCE防止编译器优化，从内存中读取真实数据
-  hrtimer_forward_now(timer, period);
+	vdaq_ring_push(dev, &sample);
 
-  return HRTIMER_RESTART; // 定时器触发后继续运行
+	/* Copy a coherent snapshot under the lock, then print outside it. */
+	spin_lock_irqsave(&dev->data_lock, flags);
+	sequence = dev->sequence;
+	generated = dev->generated_samples;
+	dropped = dev->dropped_samples;
+	head = dev->head;
+	tail = dev->tail;
+	print_status = sequence % 100 == 0;
+	spin_unlock_irqrestore(&dev->data_lock, flags);
+
+	if (print_status)
+		pr_info("vdaq: seq=%u generated=%llu dropped=%llu head=%u tail=%u\n",
+			sequence, generated, dropped, head, tail);
+
+	period = READ_ONCE(dev->period);
+	hrtimer_forward_now(timer, period);
+
+	return HRTIMER_RESTART;
 }
 
-static int __init vdaq_init(void) {
-  int ret = 0;
-  
-  // 1. vdev初始化
-  vdev.head = 0;
-  vdev.tail = 0;
-  vdev.seq = 0;
-  vdev.read_samples = 0;
-  vdev.buffer_overflows = 0;
-  vdev.generated_samples = 0;
-  vdev.dropped_samples = 0;
-  vdev.running = true;
-  vdev.sample_rate = 100; // 默认采样率 100Hz
-  spin_lock_init(&vdev.lock);
-  mutex_init(&vdev.ctrl_lock);
-  init_waitqueue_head(&vdev.wq);
-  // 设置 period = 10ms
-  vdev.period = ktime_set(0, VDAQ_PERIOD_NS);
+static int __init vdaq_init(void)
+{
+	struct vdaq_dev *dev = &vdaq_device;
+	int ret;
 
-  // 2. 创建设备节点
+	/* 1. 初始化设备运行状态和同步原语。 */
+	dev->head = 0;
+	dev->tail = 0;
+	dev->sequence = 0;
+	dev->generated_samples = 0;
+	dev->read_samples = 0;
+	dev->dropped_samples = 0;
+	dev->buffer_overflows = 0;
+	dev->sample_rate = VDAQ_DEFAULT_RATE_HZ;
+	dev->period = ns_to_ktime(VDAQ_DEFAULT_PERIOD_NS);
+	dev->running = true;
 
-  printk("chrdev init\n");
-  ret = alloc_chrdev_region(&vdaq.devno, 0, DEV_CNT, DEV_NAME);
-  if (ret < 0) {
-    printk(KERN_ERR "vdaq: Failed to allocate device number\n");
-    goto alloc_err;
-  }
-  printk(KERN_INFO "vdaq: Major=%d, Minor=%d\n", MAJOR(vdaq.devno),
-         MINOR(vdaq.devno));
+	spin_lock_init(&dev->data_lock);
+	mutex_init(&dev->control_lock);
+	init_waitqueue_head(&dev->read_queue);
 
-  cdev_init(&vdaq.cdev, &vdaq_fops);
-  ret = cdev_add(&vdaq.cdev, vdaq.devno, DEV_CNT);
-  if (ret < 0) {
-    printk(KERN_ERR "vdaq: Failed to add cdev\n");
-    goto add_err;
-  }
+	/* 2. 注册字符设备并创建 /dev/vdaq0。 */
+	ret = alloc_chrdev_region(&vdaq_chrdev.devno, 0, VDAQ_DEVICE_COUNT,
+				  VDAQ_DEVICE_NAME);
+	if (ret) {
+		pr_err("vdaq: failed to allocate device number: %d\n", ret);
+		return ret;
+	}
 
-  vdaq.class = class_create(THIS_MODULE, DEV_NAME);
-  // vdaq.class = class_create(THIS_MODULE, DEV_NAME); // C90标准
+	pr_info("vdaq: major=%u minor=%u\n",
+		MAJOR(vdaq_chrdev.devno), MINOR(vdaq_chrdev.devno));
 
-  if (IS_ERR(vdaq.class)) {
-    ret = PTR_ERR(vdaq.class);
-    printk(KERN_ERR "vdaq: Failed to create class\n");
-    goto class_err;
-  }
+	cdev_init(&vdaq_chrdev.cdev, &vdaq_fops);
+	vdaq_chrdev.cdev.owner = THIS_MODULE;
 
-  vdaq.device = device_create(vdaq.class, NULL, vdaq.devno, NULL, DEV_NAME);
-  if (IS_ERR(vdaq.device)) {
-    ret = PTR_ERR(vdaq.device);
-    printk(KERN_ERR "vdaq: Failed to create device\n");
-    goto device_err;
-  }
+	ret = cdev_add(&vdaq_chrdev.cdev, vdaq_chrdev.devno,
+		       VDAQ_DEVICE_COUNT);
+	if (ret) {
+		pr_err("vdaq: failed to add cdev: %d\n", ret);
+		goto err_unregister_chrdev;
+	}
 
-  
-  // 3. hrtimer启动 建议在所有资源创建成功之后
-  // hrtimer初始化
-  // hrtimer_setup(&vdev.timer, vdaq_timer_callback, CLOCK_MONOTONIC,
-  // HRTIMER_MODE_REL);
-  // // 设置回调函数, 内核6.14版本之前需手动设置回调函数,
-  hrtimer_init(&vdev.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-  vdev.timer.function = vdaq_timer_callback;
-  // 启动hrtimer, 每过period后触发回调函数
-  hrtimer_start(&vdev.timer, vdev.period, HRTIMER_MODE_REL);
+	/* Linux 5.10 uses the two-argument class_create() form. */
+	vdaq_chrdev.class = class_create(THIS_MODULE, VDAQ_DEVICE_NAME);
+	if (IS_ERR(vdaq_chrdev.class)) {
+		ret = PTR_ERR(vdaq_chrdev.class);
+		pr_err("vdaq: failed to create class: %d\n", ret);
+		goto err_del_cdev;
+	}
 
-  printk(KERN_INFO "vdaq: Module initialized successfully\n");
-  return 0;
+	vdaq_chrdev.device = device_create(vdaq_chrdev.class, NULL,
+					   vdaq_chrdev.devno, NULL,
+					   VDAQ_DEVICE_NAME);
+	if (IS_ERR(vdaq_chrdev.device)) {
+		ret = PTR_ERR(vdaq_chrdev.device);
+		pr_err("vdaq: failed to create device: %d\n", ret);
+		goto err_destroy_class;
+	}
 
-device_err:
-  class_destroy(vdaq.class);
-class_err:
-  cdev_del(&vdaq.cdev);
-add_err:
-  unregister_chrdev_region(vdaq.devno, DEV_CNT);
-alloc_err:
-  return ret;
+	/* 3. 所有资源就绪后再初始化并启动 hrtimer。 */
+	hrtimer_init(&dev->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	dev->timer.function = vdaq_timer_callback;
+	hrtimer_start(&dev->timer, dev->period, HRTIMER_MODE_REL);
+
+	pr_info("vdaq: module initialized, rate=%u Hz\n", dev->sample_rate);
+	return 0;
+
+err_destroy_class:
+	class_destroy(vdaq_chrdev.class);
+err_del_cdev:
+	cdev_del(&vdaq_chrdev.cdev);
+err_unregister_chrdev:
+	unregister_chrdev_region(vdaq_chrdev.devno, VDAQ_DEVICE_COUNT);
+	return ret;
 }
 
-static void __exit vdaq_exit(void) {
-  printk(KERN_INFO "vdaq: Removing module\n");
-  // 取消hrtimer, 一般最先取消
-  hrtimer_cancel(&vdev.timer);
+static void __exit vdaq_exit(void)
+{
+	struct vdaq_dev *dev = &vdaq_device;
 
-  // 销毁设备
-  device_destroy(vdaq.class, vdaq.devno);
-  // 销毁类
-  class_destroy(vdaq.class);
-  // 删除 cdev
-  cdev_del(&vdaq.cdev);
-  // 释放设备号
-  unregister_chrdev_region(vdaq.devno, DEV_CNT);
+	pr_info("vdaq: removing module\n");
 
-  printk(KERN_INFO "vdaq: Module removed\n");
+	/* 先停止数据源，确保后续不再访问即将释放的资源。 */
+	WRITE_ONCE(dev->running, false);
+	hrtimer_cancel(&dev->timer);
+	wake_up_interruptible(&dev->read_queue);
+
+	device_destroy(vdaq_chrdev.class, vdaq_chrdev.devno);
+	class_destroy(vdaq_chrdev.class);
+	cdev_del(&vdaq_chrdev.cdev);
+	unregister_chrdev_region(vdaq_chrdev.devno, VDAQ_DEVICE_COUNT);
+
+	pr_info("vdaq: module removed\n");
 }
 
 module_init(vdaq_init);
@@ -372,4 +492,5 @@ module_exit(vdaq_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Komorebi");
-MODULE_DESCRIPTION("Character Device Driver");
+MODULE_DESCRIPTION("Virtual multi-channel data acquisition character driver");
+MODULE_VERSION("0.3");
