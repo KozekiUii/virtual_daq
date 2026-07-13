@@ -29,8 +29,37 @@ Implemented ioctl control:
 Solved blocked reader wakeup problem using wait queue condition and
 wake_up_interruptible.
 
-## Next
+## Stage 4: Event-driven I/O
 
--   poll/select/epoll
--   fault recovery
--   sysfs interface
+Implemented:
+
+- driver poll callback
+- poll/select compatibility
+- non-blocking read
+- epoll LT mode
+- epoll ET mode
+- multiple file descriptor monitoring
+- buffered-data draining before HUP
+
+Problems solved:
+
+### Incorrect readable state
+
+- The result of ring_empty() was initially assigned directly to readable,
+causing poll to report the opposite state.
+
+- Solution:
+
+```c
+readable = !vdaq_ring_empty(dev);
+```
+
+- ET mode did not report HUP after draining
+
+After the final buffered sample was read, epoll was not notified that the
+device had entered the stopped-and-empty state.
+
+- Solution:
+
+Wake the read queue when the last sample is consumed while the device is
+stopped, allowing the poll callback to return EPOLLHUP.

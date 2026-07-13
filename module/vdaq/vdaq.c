@@ -26,6 +26,7 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/poll.h>
 
 #define VDAQ_DEVICE_NAME	"vdaq0"
 #define VDAQ_DEVICE_COUNT	1
@@ -91,8 +92,10 @@ static struct vdaq_dev vdaq_device;
 static int vdaq_open(struct inode *inode, struct file *file);
 static int vdaq_release(struct inode *inode, struct file *file);
 static ssize_t vdaq_read(struct file *file, char __user *buf, size_t count,
-			 loff_t *ppos);
+                         loff_t *ppos);
+static __poll_t vdaq_poll(struct file *filp, struct poll_table_struct *wait);
 static long vdaq_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
 
 /* Sampling and ring-buffer helpers. */
 static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer);
@@ -103,10 +106,10 @@ static bool vdaq_ring_empty(const struct vdaq_dev *dev);
 static const struct file_operations vdaq_fops = {
     .owner = THIS_MODULE,
     .read = vdaq_read,
+    .poll = vdaq_poll,
     .unlocked_ioctl = vdaq_ioctl,
     .open = vdaq_open,
-    .release	= vdaq_release,
-	
+    .release = vdaq_release,
 };
 
 static int vdaq_open(struct inode *inode, struct file *file)
@@ -142,7 +145,8 @@ static bool vdaq_ring_empty(const struct vdaq_dev *dev)
  */
 static int vdaq_ring_pop(struct vdaq_dev *dev, struct vdaq_sample *sample)
 {
-	unsigned long flags;
+  unsigned long flags;
+  bool notify_hup = false;
 
 	spin_lock_irqsave(&dev->data_lock, flags);
 
@@ -155,7 +159,16 @@ static int vdaq_ring_pop(struct vdaq_dev *dev, struct vdaq_sample *sample)
 	dev->tail = (dev->tail + 1) % VDAQ_BUFFER_SIZE;
 	dev->read_samples++;
 
-	spin_unlock_irqrestore(&dev->data_lock, flags);
+  /*
+  * 设备已经停止，并且本次读取恰好取走最后一帧。
+  * 此时 poll 状态将从“可读”变成“挂断”。
+  */
+  if (dev->head == dev->tail && !dev->running)
+    notify_hup = true;
+  spin_unlock_irqrestore(&dev->data_lock, flags);
+
+  if(notify_hup)
+    wake_up_interruptible_poll(&dev->read_queue, EPOLLIN | EPOLLRDNORM);
 	return 0;
 }
 
@@ -175,28 +188,66 @@ static ssize_t vdaq_read(struct file *file, char __user *buf, size_t count,
 	if (count < sizeof(sample))
 		return -EINVAL;
 
-	/* 如果环形缓冲区为空，则阻塞等待。停止设备也会唤醒读进程。 */
-	ret = wait_event_interruptible(
-		vdaq_device.read_queue,
-		!vdaq_ring_empty(&vdaq_device) ||
-		!READ_ONCE(vdaq_device.running));
-	if (ret)
-		return ret;
+  /*
+   * 非阻塞模式：
+   * 缓冲区为空时立即返回，不进入等待队列
+   */
+  if (vdaq_ring_empty(&vdaq_device)){
+    if (!READ_ONCE(vdaq_device.running)) {
+      return -EAGAIN;
+    }
+    if (file->f_flags & O_NONBLOCK) {
+      return -EAGAIN;
+    }
+    ret = wait_event_interruptible(vdaq_device.read_queue,
+                                   !vdaq_ring_empty(&vdaq_device) ||
+                                       !READ_ONCE(vdaq_device.running));
+    if (ret) {
+      return ret;
+    }
+  }
 
-	if (vdaq_ring_empty(&vdaq_device) &&
-	    !READ_ONCE(vdaq_device.running))
-		return -EAGAIN;
+  /*
+  * STOP 可能唤醒 reader。
+  * 若此时没有剩余数据，则返回 EAGAIN。
+  */
+  if (vdaq_ring_empty(&vdaq_device) && !READ_ONCE(vdaq_device.running)) {
+    return -EAGAIN;
+  }
+      
+  ret = vdaq_ring_pop(&vdaq_device, &sample);
+  if (ret)
+    return -EAGAIN;
 
-	ret = vdaq_ring_pop(&vdaq_device, &sample);
-	if (ret)
-		return ret;
+  /* copy_to_user() 可能睡眠，因此必须在释放自旋锁后调用。 */
+  if (copy_to_user(buf, &sample, sizeof(sample)))
+    return -EFAULT;
 
-	/* copy_to_user() 可能睡眠，因此必须在释放自旋锁后调用。 */
-	if (copy_to_user(buf, &sample, sizeof(sample)))
-		return -EFAULT;
+  /* 数据源是持续流，不使用文件偏移量 *ppos。 */
+  return sizeof(sample);
+}
 
-	/* 数据源是持续流，不使用文件偏移量 *ppos。 */
-	return sizeof(sample);
+static __poll_t vdaq_poll(struct file *filp, struct poll_table_struct *wait) {
+  __poll_t mask = 0;
+  unsigned long flags;
+  bool readable;
+  bool running;
+  // 登记等待队列，以便在数据可用时唤醒阻塞的 poll() 调用。
+  poll_wait(filp, &vdaq_device.read_queue, wait);
+
+  spin_lock_irqsave(&vdaq_device.data_lock, flags);
+  readable = !vdaq_ring_empty(&vdaq_device);
+  running = vdaq_device.running;
+  spin_unlock_irqrestore(&vdaq_device.data_lock, flags);
+
+  if (readable) {
+    mask |= EPOLLIN | EPOLLRDNORM;
+  }
+  else if (!readable && !running) {
+    mask |= EPOLLHUP;
+  }
+
+  return mask;
 }
 
 /**
