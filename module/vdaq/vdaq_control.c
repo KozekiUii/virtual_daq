@@ -47,6 +47,10 @@ static enum hrtimer_restart vdaq_timer_callback(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+bool vdaq_is_running(struct vdaq_device *dev) {
+  return READ_ONCE(dev->running);
+}
+
 void vdaq_control_init(struct vdaq_device *dev)
 {
 	mutex_init(&dev->control_lock);
@@ -103,6 +107,17 @@ int vdaq_set_rate(struct vdaq_device *dev, unsigned int rate)
 	return 0;
 }
 
+int vdaq_get_rate(struct vdaq_device *dev, unsigned int *rate)
+{
+    if (!rate)
+        return -EINVAL;
+
+    mutex_lock(&dev->control_lock);
+    *rate = dev->sample_rate;
+    mutex_unlock(&dev->control_lock);
+    return 0;
+}
+
 void vdaq_get_status(struct vdaq_device *dev, struct vdaq_stats *stats)
 {
 	unsigned long flags;
@@ -115,8 +130,12 @@ void vdaq_get_status(struct vdaq_device *dev, struct vdaq_stats *stats)
 	stats->current_sequence = dev->sequence;
 	stats->buffer_head = dev->head;
 	stats->buffer_tail = dev->tail;
-	stats->running = READ_ONCE(dev->running);
 	spin_unlock_irqrestore(&dev->data_lock, flags);
+
+	mutex_lock(&dev->control_lock);
+	stats->rate = dev->sample_rate;
+	stats->running = dev->running;
+	mutex_unlock(&dev->control_lock);
 }
 
 static long vdaq_ioctl_get_status(struct vdaq_device *dev,

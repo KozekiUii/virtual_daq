@@ -14,6 +14,7 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
+#define VDAQ_CLASS_NAME "vdaq"
 #define VDAQ_DEVICE_NAME "vdaq0"
 #define VDAQ_DEVICE_COUNT 1
 #define VDAQ_BUFFER_SIZE 1024
@@ -26,7 +27,8 @@ struct vdaq_device {
 	struct cdev cdev;
 	struct class *class;
 	struct device *device;
-
+	struct dentry *debugfs_root;
+        
 	struct vdaq_sample buffer[VDAQ_BUFFER_SIZE];
 	unsigned int head;
 	unsigned int tail;
@@ -55,12 +57,19 @@ ssize_t vdaq_read(struct file *file, char __user *buf, size_t count,
 		  loff_t *ppos);
 __poll_t vdaq_poll(struct file *file, struct poll_table_struct *wait);
 
+bool vdaq_is_running(struct vdaq_device *dev);
 void vdaq_control_init(struct vdaq_device *dev);
 void vdaq_control_shutdown(struct vdaq_device *dev);
 void vdaq_start(struct vdaq_device *dev);
 void vdaq_stop(struct vdaq_device *dev);
 int vdaq_set_rate(struct vdaq_device *dev, unsigned int rate);
+int vdaq_get_rate(struct vdaq_device *dev, unsigned int *rate);
 void vdaq_get_status(struct vdaq_device *dev, struct vdaq_stats *stats);
 long vdaq_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
+int vdaq_sysfs_register(struct vdaq_device *dev);
+void vdaq_sysfs_unregister(struct vdaq_device *dev);
+
+int vdaq_debugfs_init(struct vdaq_device *dev);
+void vdaq_debugfs_exit(struct vdaq_device *dev);
 #endif

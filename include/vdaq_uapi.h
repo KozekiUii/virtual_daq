@@ -39,6 +39,7 @@ struct vdaq_stats {
     __u32 current_sequence;
     __u32 buffer_head;
     __u32 buffer_tail;
+    __u32 rate;
     __u32 running; // 1表示正在运行，0表示已停止
 #else
     uint64_t generated_samples;
@@ -48,6 +49,7 @@ struct vdaq_stats {
     uint32_t current_sequence;
     uint32_t buffer_head;
     uint32_t buffer_tail;
+    uint32_t rate;
     uint32_t running; // 1表示正在运行，0表示已停止
 #endif
 };

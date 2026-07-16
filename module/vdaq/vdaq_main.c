@@ -28,12 +28,12 @@ static int vdaq_release(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations vdaq_fops = {
-	.owner = THIS_MODULE,
-	.open = vdaq_open,
-	.release = vdaq_release,
-	.read = vdaq_read,
-	.poll = vdaq_poll,
-	.unlocked_ioctl = vdaq_ioctl,
+    .owner = THIS_MODULE,
+    .open = vdaq_open,
+    .release = vdaq_release,
+    .read = vdaq_read,
+    .poll = vdaq_poll,
+    .unlocked_ioctl = vdaq_ioctl,
 };
 
 static void vdaq_chrdev_unregister(struct vdaq_device *dev)
@@ -58,13 +58,13 @@ static int vdaq_chrdev_register(struct vdaq_device *dev)
 	if (ret)
 		goto err_unregister;
 
-	dev->class = class_create(THIS_MODULE, VDAQ_DEVICE_NAME);
+	dev->class = class_create(THIS_MODULE, VDAQ_CLASS_NAME);
 	if (IS_ERR(dev->class)) {
 		ret = PTR_ERR(dev->class);
 		goto err_del_cdev;
-	}
-	dev->device = device_create(dev->class, NULL, dev->devno, dev,
-				    VDAQ_DEVICE_NAME);
+  }
+  dev->device = device_create(dev->class, NULL, dev->devno, dev, VDAQ_DEVICE_NAME);
+  
 	if (IS_ERR(dev->device)) {
 		ret = PTR_ERR(dev->device);
 		goto err_destroy_class;
@@ -93,19 +93,32 @@ static int __init vdaq_init(void)
 		return ret;
 	}
 
-	vdaq_start(dev);
-	pr_info("vdaq: module initialized, major=%u minor=%u rate=%u Hz\n",
-		MAJOR(dev->devno), MINOR(dev->devno), dev->sample_rate);
-	return 0;
+  ret = vdaq_sysfs_register(dev);
+  if (ret) {
+    pr_err("vdaq: sysfs registration failed: %d\n", ret);
+    vdaq_chrdev_unregister(dev);
+    return ret;
+  }
+  ret = vdaq_debugfs_init(dev);
+  if (ret) {
+    pr_err("vdaq: debugfs registration failed: %d\n", ret);
+  }
+
+  vdaq_start(dev);
+  pr_info("vdaq: module initialized, major=%u minor=%u rate=%u Hz\n",
+    MAJOR(dev->devno), MINOR(dev->devno), dev->sample_rate);
+  return 0;
 }
 
 static void __exit vdaq_exit(void)
 {
 	struct vdaq_device *dev = &vdaq_device;
 
-	pr_info("vdaq: removing module\n");
+  pr_info("vdaq: removing module\n");
+  vdaq_debugfs_exit(dev);
+	vdaq_sysfs_unregister(dev);  
 	vdaq_control_shutdown(dev);
-	vdaq_chrdev_unregister(dev);
+	vdaq_chrdev_unregister(dev);  
 	pr_info("vdaq: module removed\n");
 }
 

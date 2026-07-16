@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
@@ -38,6 +39,7 @@ int main(int argc, char *argv[]) {
     printf("Current Sequence: %u\n", stats.current_sequence);
     printf("Buffer Head: %u\n", stats.buffer_head);
     printf("Buffer Tail: %u\n", stats.buffer_tail);
+    printf("Rate: %u\n",stats.rate);
     printf("Running: %u\n", stats.running);
   } else if (strcmp(argv[1], "stop") == 0) {
     if (ioctl(fd, VDAQ_IOCTL_STOP) < 0) {
